@@ -1,0 +1,342 @@
+/**
+ * server.js - IANO.DRS backend (single-file)
+ *
+ * - Firebase Admin (Firestore + Auth)
+ * - Endpoints: register, login, profile, vouchers (generate/redeem/list), billing, maintenance, ai/support (placeholder), admin reports
+ * - Admin endpoints protected by ADMIN_KEY env var (simple header check)
+ *
+ * How to provide credentials:
+ *  - Upload serviceAccountKey.json to project root OR
+ *  - Set FIREBASE_KEY env var = stringified JSON of service account
+ *
+ * Set ADMIN_KEY env var to protect admin routes.
+ */
+
+const express = require("express");
+const bodyParser = require("body-parser");
+const cors = require("cors");
+const admin = require("firebase-admin");
+const fs = require("fs");
+const path = require("path");
+const bcrypt = require("bcryptjs");
+const { v4: uuidv4 } = require("uuid");
+
+const PORT = process.env.PORT || 5000;
+const ADMIN_KEY = process.env.ADMIN_KEY || "please-change-admin-key";
+const SERVICE_KEY_PATH = path.join(__dirname, "serviceAccountKey.json");
+
+// -------- Firebase init -----------
+function initFirebase() {
+  // If serviceAccountKey.json exists, use it
+  try {
+    if (fs.existsSync(SERVICE_KEY_PATH)) {
+      const serviceAccount = require(SERVICE_KEY_PATH);
+      admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
+      console.log("✅ Firebase initialized using serviceAccountKey.json");
+      return;
+    }
+  } catch (e) {
+    console.warn("Could not init from file:", e.message);
+  }
+
+  // Else, use FIREBASE_KEY env var (JSON string)
+  if (process.env.FIREBASE_KEY) {
+    try {
+      const serviceAccount = JSON.parse(process.env.FIREBASE_KEY);
+      admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
+      console.log("✅ Firebase initialized using FIREBASE_KEY env var");
+      return;
+    } catch (e) {
+      console.error("Failed to parse FIREBASE_KEY env var:", e.message);
+    }
+  }
+
+  console.error("❌ Firebase credentials NOT provided. Provide serviceAccountKey.json or FIREBASE_KEY.");
+  process.exit(1);
+}
+
+initFirebase();
+const db = admin.firestore();
+
+// -------- Helpers ----------
+const now = () => new Date().toISOString();
+const genVoucherCode = () => uuidv4().slice(0, 8).toUpperCase();
+
+async function hashPassword(password) {
+  return await bcrypt.hash(password, 8);
+}
+async function comparePassword(plain, hash) {
+  return await bcrypt.compare(plain, hash);
+}
+
+function requireAdmin(req, res, next) {
+  const key = req.header("x-admin-key") || req.query.adminKey;
+  if (!key || key !== ADMIN_KEY) return res.status(403).json({ success: false, error: "Admin key required" });
+  next();
+}
+
+const app = express();
+app.use(cors());
+app.use(bodyParser.json());
+
+// ---------- Routes ----------
+
+// Health
+app.get("/", (req, res) => res.json({ success: true, message: "IANO.DRS Backend (Firebase) running" }));
+
+// ---------- AUTH & PROFILE ----------
+// Register: creates Firebase Auth user + Firestore profile
+app.post("/register", async (req, res) => {
+  try {
+    const { email, password, name } = req.body;
+    if (!email || !password) return res.status(400).json({ success: false, error: "email & password required" });
+
+    // check Firestore for existing email
+    const usersRef = db.collection("users");
+    const q = await usersRef.where("email", "==", email.toLowerCase()).get();
+    if (!q.empty) return res.status(400).json({ success: false, error: "Email already registered" });
+
+    // create Firebase Auth user
+    const userRecord = await admin.auth().createUser({ email, password, displayName: name || "" });
+
+    // store minimal profile in Firestore + hashed password for REST-login fallback
+    const passwordHash = await hashPassword(password);
+    await usersRef.doc(userRecord.uid).set({
+      id: userRecord.uid,
+      email: email.toLowerCase(),
+      name: name || "",
+      passwordHash,
+      createdAt: now()
+    });
+
+    res.json({ success: true, message: "Registered", uid: userRecord.uid });
+  } catch (err) {
+    console.error("register error:", err);
+    res.status(500).json({ success: false, error: err.message || String(err) });
+  }
+});
+
+// Login: checks Firestore hashed password (we store hash during register)
+app.post("/login", async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    if (!email || !password) return res.status(400).json({ success: false, error: "email & password required" });
+
+    const usersRef = db.collection("users");
+    const q = await usersRef.where("email", "==", email.toLowerCase()).limit(1).get();
+    if (q.empty) return res.status(400).json({ success: false, error: "User not found" });
+
+    const user = q.docs[0].data();
+    const ok = await comparePassword(password, user.passwordHash || "");
+    if (!ok) return res.status(400).json({ success: false, error: "Wrong password" });
+
+    res.json({ success: true, uid: user.id, profile: { id: user.id, email: user.email, name: user.name } });
+  } catch (err) {
+    console.error("login error:", err);
+    res.status(500).json({ success: false, error: err.message || String(err) });
+  }
+});
+
+// Profile: GET /profile?devUser=<uid> or header x-user-id
+app.get("/profile", async (req, res) => {
+  try {
+    const uid = req.query.devUser || req.header("x-user-id");
+    if (!uid) return res.status(400).json({ success: false, error: "uid required" });
+
+    const doc = await db.collection("users").doc(uid).get();
+    if (!doc.exists) return res.status(404).json({ success: false, error: "User not found" });
+
+    const data = doc.data();
+    res.json({ success: true, profile: { id: data.id, email: data.email, name: data.name, createdAt: data.createdAt } });
+  } catch (err) {
+    console.error("profile error:", err);
+    res.status(500).json({ success: false, error: err.message || String(err) });
+  }
+});
+
+// ---------- VOUCHERS ----------
+
+// Admin generate voucher: POST /voucher/generate { value }
+app.post("/voucher/generate", requireAdmin, async (req, res) => {
+  try {
+    const { value } = req.body;
+    if (value === undefined) return res.status(400).json({ success: false, error: "value required" });
+
+    const code = genVoucherCode();
+    const voucher = { code, value: Number(value), used: false, createdAt: now() };
+    await db.collection("vouchers").doc(code).set(voucher);
+
+    res.json({ success: true, voucher });
+  } catch (err) {
+    console.error("voucher.generate error:", err);
+    res.status(500).json({ success: false, error: err.message || String(err) });
+  }
+});
+
+// List vouchers (public)
+app.get("/vouchers", async (req, res) => {
+  try {
+    const snaps = await db.collection("vouchers").get();
+    const vouchers = snaps.docs.map(d => d.data());
+    res.json({ success: true, vouchers });
+  } catch (err) {
+    console.error("vouchers.list error:", err);
+    res.status(500).json({ success: false, error: err.message || String(err) });
+  }
+});
+
+// Redeem voucher: POST /voucher/redeem { code, userId }
+app.post("/voucher/redeem", async (req, res) => {
+  try {
+    const { code, userId } = req.body;
+    if (!code || !userId) return res.status(400).json({ success: false, error: "code and userId required" });
+
+    const voucherRef = db.collection("vouchers").doc(code);
+    const snap = await voucherRef.get();
+    if (!snap.exists) return res.status(404).json({ success: false, error: "Voucher not found" });
+
+    const voucher = snap.data();
+    if (voucher.used) return res.status(400).json({ success: false, error: "Voucher already used" });
+
+    // mark used
+    await voucherRef.update({ used: true, usedBy: userId, usedAt: now() });
+
+    // create transaction
+    const txnId = uuidv4();
+    const txn = { id: txnId, userId, amount: Number(voucher.value || 0), type: "voucher_credit", createdAt: now() };
+    await db.collection("billing").doc(txnId).set(txn);
+    await db.collection("users").doc(userId).collection("transactions").doc(txnId).set(txn);
+
+    res.json({ success: true, message: "Voucher redeemed", voucher: { ...voucher, used: true, usedBy: userId }, transaction: txn });
+  } catch (err) {
+    console.error("voucher.redeem error:", err);
+    res.status(500).json({ success: false, error: err.message || String(err) });
+  }
+});
+
+// ---------- BILLING ----------
+
+// Create transaction: POST /billing/transaction { userId, amount, type }
+app.post("/billing/transaction", async (req, res) => {
+  try {
+    const { userId, amount, type } = req.body;
+    if (!userId || amount === undefined) return res.status(400).json({ success: false, error: "userId and amount required" });
+
+    const id = uuidv4();
+    const txn = { id, userId, amount: Number(amount), type: type || "manual", createdAt: now() };
+    await db.collection("billing").doc(id).set(txn);
+    await db.collection("users").doc(userId).collection("transactions").doc(id).set(txn);
+
+    res.json({ success: true, transaction: txn });
+  } catch (err) {
+    console.error("billing.transaction error:", err);
+    res.status(500).json({ success: false, error: err.message || String(err) });
+  }
+});
+
+// Get user transactions: GET /transactions/:userId
+app.get("/transactions/:userId", async (req, res) => {
+  try {
+    const userId = req.params.userId;
+    const snaps = await db.collection("users").doc(userId).collection("transactions").get();
+    const transactions = snaps.docs.map(d => d.data());
+    res.json({ success: true, transactions });
+  } catch (err) {
+    console.error("transactions error:", err);
+    res.status(500).json({ success: false, error: err.message || String(err) });
+  }
+});
+
+// Get balance: GET /balance/:userId
+app.get("/balance/:userId", async (req, res) => {
+  try {
+    const userId = req.params.userId;
+    const snaps = await db.collection("users").doc(userId).collection("transactions").get();
+    const total = snaps.docs.reduce((s, d) => s + (Number(d.data().amount) || 0), 0);
+    res.json({ success: true, balance: total });
+  } catch (err) {
+    console.error("balance error:", err);
+    res.status(500).json({ success: false, error: err.message || String(err) });
+  }
+});
+
+// ---------- MAINTENANCE ----------
+
+// Report issue: POST /maintenance/report { userId, issue, title? }
+app.post("/maintenance/report", async (req, res) => {
+  try {
+    const { userId, issue, title } = req.body;
+    if (!userId || !issue) return res.status(400).json({ success: false, error: "userId and issue required" });
+
+    const id = uuidv4();
+    const record = { id, userId, issue, title: title || issue, status: "pending", createdAt: now() };
+    await db.collection("maintenance").doc(id).set(record);
+
+    res.json({ success: true, id, record });
+  } catch (err) {
+    console.error("maintenance.report error:", err);
+    res.status(500).json({ success: false, error: err.message || String(err) });
+  }
+});
+
+// List maintenance: GET /maintenance/list
+app.get("/maintenance/list", async (req, res) => {
+  try {
+    const snaps = await db.collection("maintenance").get();
+    const issues = snaps.docs.map(d => d.data());
+    res.json({ success: true, issues });
+  } catch (err) {
+    console.error("maintenance.list error:", err);
+    res.status(500).json({ success: false, error: err.message || String(err) });
+  }
+});
+
+// ---------- AI SUPPORT (placeholder) ----------
+app.post("/ai/support", (req, res) => {
+  try {
+    const { question } = req.body;
+    if (!question) return res.status(400).json({ success: false, error: "question required" });
+    const answer = `AI Assistant (dev): I received your question: "${question}". (placeholder answer)`;
+    res.json({ success: true, answer });
+  } catch (err) {
+    console.error("ai.support error:", err);
+    res.status(500).json({ success: false, error: err.message || String(err) });
+  }
+});
+
+// ---------- ADMIN ROUTES ----------
+
+// Admin summary: GET /admin/reports/summary
+app.get("/admin/reports/summary", requireAdmin, async (req, res) => {
+  try {
+    const usersSnap = await db.collection("users").get();
+    const vouchersSnap = await db.collection("vouchers").get();
+    const billingSnap = await db.collection("billing").get();
+
+    const userCount = usersSnap.size;
+    const vouchersUsed = vouchersSnap.docs.filter(d => d.data().used).length;
+    const revenue = billingSnap.docs.reduce((s, d) => s + (Number(d.data().amount) || 0), 0);
+
+    res.json({ success: true, summary: { userCount, vouchersUsed, revenue } });
+  } catch (err) {
+    console.error("admin.summary error:", err);
+    res.status(500).json({ success: false, error: err.message || String(err) });
+  }
+});
+
+// Admin: list users GET /admin/users
+app.get("/admin/users", requireAdmin, async (req, res) => {
+  try {
+    const snaps = await db.collection("users").get();
+    const users = snaps.docs.map(d => d.data());
+    res.json({ success: true, users });
+  } catch (err) {
+    console.error("admin.users error:", err);
+    res.status(500).json({ success: false, error: err.message || String(err) });
+  }
+});
+
+// ---------- Start ----------
+app.listen(PORT, () => {
+  console.log(`IANO.DRS backend running on port ${PORT}`);
+});
